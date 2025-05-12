@@ -2,8 +2,8 @@ defmodule Webdav.Router do
   use Plug.Router
   require Logger
 
-  plug :match
-  plug :dispatch
+  plug(:match)
+  plug(:dispatch)
 
   match "webdav/*path" do
     case conn.method do

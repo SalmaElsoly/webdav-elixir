@@ -35,13 +35,13 @@ defmodule Webdav.Handlers do
                         <h1>#{String.replace(node_path, @storage_path, "")}</h1>
                         <ul>
                           #{files |> Enum.map(fn file ->
-                    current_path = String.replace(node_path, @storage_path, "") |> Path.join(file)
-                    "<li><a href=\"/webdav#{current_path}\">#{file}</a></li>"
-                  end) |> Enum.join("\n")}
+                      current_path = String.replace(node_path, @storage_path, "") |> Path.join(file)
+                      "<li><a href=\"/webdav#{current_path}\">#{file}</a></li>"
+                    end) |> Enum.join("\n")}
                         </ul>
                     </body></html>"
 
-                send_resp(conn, 200, content)
+                  send_resp(conn, 200, content)
 
                 {:error, reason} ->
                   send_resp(conn, 500, "Failed to list files #{inspect(reason)}")
@@ -108,14 +108,14 @@ defmodule Webdav.Handlers do
           :ok ->
             send_resp(conn, 201, "Collection created")
 
-        {:error, :eexist} ->
-          send_resp(conn, 409, "Conflict")
+          {:error, :eexist} ->
+            send_resp(conn, 409, "Conflict")
 
-        {:error, :enospc} ->
-          send_resp(conn, 507, "Insufficient Storage")
+          {:error, :enospc} ->
+            send_resp(conn, 507, "Insufficient Storage")
 
-        {:error, reason} ->
-          send_resp(conn, 500, "Failed to create folder #{inspect(reason)}")
+          {:error, reason} ->
+            send_resp(conn, 500, "Failed to create folder #{inspect(reason)}")
         end
 
       false ->
@@ -125,7 +125,34 @@ defmodule Webdav.Handlers do
 
   # propfind in webdav
   def handle_propfind(conn) do
-    xml_body = parse_xml_body(conn)
+    path =
+      conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
+
+    depth =
+      get_req_header(conn, "depth")
+      |> List.first()
+      |> case do
+        "0" -> 0
+        "1" -> 1
+        "infinity" -> :infinity
+        _ -> :infinity
+      end
+
+    if File.exists?(path) do
+      properties = parse_xml_body(conn)
+      Logger.info("Properties: #{inspect(properties)}")
+
+      try do
+        conn
+        |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+        |> send_resp(207, xml_builder(path, properties, depth))
+      rescue
+        e ->
+          send_resp(conn, 400, "Bad Request #{inspect(e)}")
+      end
+    else
+      send_resp(conn, 404, "Not Found")
+    end
   end
 
   # proppatch in webdav
@@ -255,16 +282,110 @@ defmodule Webdav.Handlers do
   end
 
   defp parse_xml_body(conn) do
-    conn
-    |> read_body()
-    |> xpath(
-      ~x"//d:prop/*"l,
-      name: ~x"name()"s
-    )
-    |> Enum.map(& &1.name)
+    case read_body(conn) do
+      {:ok, body, _conn} when byte_size(body) > 0 ->
+        try do
+          all_props = body |> xpath(~x"//D:allprop"l)
+
+          Logger.info("All props: #{inspect(all_props)}")
+
+          if length(all_props) > 0 do
+            [
+              "getcontentlength",
+              "getlastmodified",
+              "resourcetype",
+              "creationdate",
+              "getcontenttype",
+              "displayname",
+              "getcontentlanguage",
+              "getetag"
+            ]
+          else
+            props =
+              body
+              |> xpath(~x"//D:prop/*"l)
+              |> Enum.map(fn node -> node |> xpath(~x"local-name()"s) end)
+
+            if Enum.empty?(props) do
+              ["getcontentlength", "getlastmodified", "resourcetype", "creationdate"]
+            else
+              props
+            end
+          end
+        rescue
+          e ->
+            Logger.error("Error parsing propfind: #{inspect(e)}")
+            ["getcontentlength", "getlastmodified", "resourcetype", "creationdate"]
+        end
+
+      _ ->
+        ["getcontentlength", "getlastmodified", "resourcetype", "creationdate"]
+    end
   end
+
+  defp xml_builder(path, properties, depth) do
+    response = build_response(path, properties)
+
+    children =
+      if depth > 0 and File.dir?(path) do
+        case File.ls(path) do
+          {:ok, files} ->
+            files
+            |> Enum.map(fn file -> build_response(Path.join(path, file), properties) end)
+            |> Enum.join("\n")
+
+          {:error, reason} ->
+            Logger.error("Error listing files: #{inspect(reason)}")
+            ""
+        end
+      else
+        ""
+      end
+
+    """
+    <D:multistatus xmlns:D="DAV:">
+      #{response}
+      #{children}
+    </D:multistatus>
+    """
+  end
+
+  defp build_response(path, properties) do
+    """
+    <D:response>
+      <D:href>#{if String.ends_with?(path, @storage_path), do: "webdav root", else: String.replace(path, @storage_path, "")}</D:href>
+      <D:propstat>
+        <D:prop>
+          #{properties |> Enum.map(fn prop -> """
+      <D:#{prop}>
+      #{case prop do
+        "getcontentlength" -> File.stat!(path).size
+        "getlastmodified" -> File.stat!(path).mtime |> format_datetime()
+        "resourcetype" -> if File.dir?(path), do: "<D:collection/>", else: ""
+        "creationdate" -> File.stat!(path).mtime |> format_datetime()
+        "getcontenttype" -> MIME.from_path(path)
+        "displayname" -> String.replace(path, @storage_path, "")
+        "getcontentlanguage" -> "en"
+        "getetag" -> "W/\"#{path}\""
+      end}
+      </D:#{prop}>
+      """ end) |> Enum.join("\n")}
+        </D:prop>
+        <D:status>HTTP/1.1 200 OK</D:status>
+      </D:propstat>
+    </D:response>
+    """
+  end
+
+  defp format_datetime({{year, month, day}, {hour, minute, second}}) do
+    "#{year}-#{pad_number(month)}-#{pad_number(day)}T#{pad_number(hour)}:#{pad_number(minute)}:#{pad_number(second)}Z"
+  end
+
+  defp pad_number(number) when number < 10, do: "0#{number}"
+  defp pad_number(number), do: "#{number}"
 end
 
 # TODO:
-# - handle propfind
-# - handle copy collection response in html
+# - handle proppatch
+# - handle lock
+# - handle unlock
