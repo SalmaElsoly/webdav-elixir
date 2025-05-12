@@ -1,7 +1,7 @@
 defmodule Webdav.Handlers do
   import Plug.Conn
   require Logger
-
+  import SweetXml
   @storage_path "./storage"
 
   def init(storage_path) do
@@ -23,9 +23,10 @@ defmodule Webdav.Handlers do
               |> send_file(200, node_path)
 
             :directory ->
-              with {:ok, files} <- File.ls(node_path) do
-                content =
-                  "<!DOCTYPE html>
+              case File.ls(node_path) do
+                {:ok, files} ->
+                  content =
+                    "<!DOCTYPE html>
                     <html>
                       <head>
                         <title>#{String.replace(node_path, @storage_path, "")}</title>
@@ -41,7 +42,7 @@ defmodule Webdav.Handlers do
                     </body></html>"
 
                 send_resp(conn, 200, content)
-              else
+
                 {:error, reason} ->
                   send_resp(conn, 500, "Failed to list files #{inspect(reason)}")
               end
@@ -64,9 +65,10 @@ defmodule Webdav.Handlers do
 
     case read_body(conn) do
       {:ok, body, conn} ->
-        with :ok <- File.write(file_path, body) do
-          send_resp(conn, 200, "File uploaded")
-        else
+        case File.write(file_path, body) do
+          :ok ->
+            send_resp(conn, 200, "File uploaded")
+
           {:error, :enoent} ->
             send_resp(conn, 409, "Conflict")
 
@@ -100,10 +102,11 @@ defmodule Webdav.Handlers do
 
     parent_path = Path.dirname(directory_path)
 
-    with true <- File.exists?(parent_path) do
-      case File.mkdir_p(directory_path) do
-        :ok ->
-          send_resp(conn, 201, "Collection created")
+    case File.exists?(parent_path) do
+      true ->
+        case File.mkdir_p(directory_path) do
+          :ok ->
+            send_resp(conn, 201, "Collection created")
 
         {:error, :eexist} ->
           send_resp(conn, 409, "Conflict")
@@ -113,8 +116,8 @@ defmodule Webdav.Handlers do
 
         {:error, reason} ->
           send_resp(conn, 500, "Failed to create folder #{inspect(reason)}")
-      end
-    else
+        end
+
       false ->
         send_resp(conn, 409, "Conflict")
     end
@@ -122,7 +125,7 @@ defmodule Webdav.Handlers do
 
   # propfind in webdav
   def handle_propfind(conn) do
-    send_resp(conn, 200, "Hello World")
+    xml_body = parse_xml_body(conn)
   end
 
   # proppatch in webdav
@@ -142,11 +145,70 @@ defmodule Webdav.Handlers do
 
   # move in webdav
   def handle_move(conn) do
-    send_resp(conn, 200, "Hello World")
+    with {:ok, source_path, destination_path} <- move_copy_options(conn) do
+      cond do
+        File.exists?(destination_path) ->
+          File.rename(source_path, destination_path)
+          send_resp(conn, 204, "Moved")
+
+        true ->
+          File.rename(source_path, destination_path)
+          send_resp(conn, 201, "Moved")
+      end
+    end
   end
 
   # copy in webdav
   def handle_copy(conn) do
+    with {:ok, source_path, destination_path} <- move_copy_options(conn) do
+      destination_existed = File.exists?(destination_path)
+
+      result =
+        if File.dir?(source_path) do
+          depth =
+            get_req_header(conn, "depth")
+            |> List.first()
+            |> case do
+              "0" -> 0
+              "1" -> 1
+              "infinity" -> :infinity
+              _ -> :infinity
+            end
+
+          case depth do
+            :infinity ->
+              File.cp_r(source_path, destination_path)
+
+            0 ->
+              File.mkdir_p(destination_path)
+
+            1 ->
+              File.mkdir_p(destination_path)
+
+              File.ls(source_path)
+              |> Enum.each(fn file ->
+                unless File.dir?(Path.join(source_path, file)) do
+                  File.cp(Path.join(source_path, file), Path.join(destination_path, file))
+                end
+              end)
+          end
+        else
+          File.cp(source_path, destination_path)
+        end
+
+      case result do
+        :ok ->
+          if destination_existed,
+            do: send_resp(conn, 204, "Copied"),
+            else: send_resp(conn, 201, "Copied")
+
+        {:error, reason} ->
+          send_resp(conn, 500, "Failed to copy: #{inspect(reason)}")
+      end
+    end
+  end
+
+  defp move_copy_options(conn) do
     source_path =
       conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
 
@@ -158,14 +220,16 @@ defmodule Webdav.Handlers do
       destination_path =
         get_req_header(conn, "destination")
         |> List.first()
+        |> URI.parse()
+        |> Map.get(:path)
         |> String.replace("/webdav", "")
         |> then(&Path.join(@storage_path, &1))
 
       overwrite =
         get_req_header(conn, "overwrite")
         |> List.first()
-        |> String.upcase()
         |> case do
+          nil -> true
           "F" -> false
           "T" -> true
           _ -> true
@@ -185,60 +249,19 @@ defmodule Webdav.Handlers do
           send_resp(conn, 412, "Precondition Failed")
 
         true ->
-          destination_existed = File.exists?(destination_path)
-
-          result =
-            if File.dir?(source_path) do
-              depth =
-                get_req_header(conn, "depth")
-                |> List.first()
-                |> case do
-                  "0" -> 0
-                  "1" -> 1
-                  "infinity" -> :infinity
-                  _ -> :infinity
-                end
-
-              case depth do
-                :infinity ->
-                  File.cp_r(source_path, destination_path)
-
-                0 ->
-                  File.mkdir_p(destination_path)
-
-                1 ->
-                  File.mkdir_p(destination_path)
-
-                  File.ls(source_path)
-                  |> Enum.each(fn file ->
-                    unless File.dir?(Path.join(source_path, file)) do
-                      File.cp(Path.join(source_path, file), Path.join(destination_path, file))
-                    end
-                  end)
-              end
-
-              {:ok, :directory}
-            else
-              case File.cp(source_path, destination_path) do
-                :ok -> {:ok, :file}
-                error -> error
-              end
-            end
-
-          case result do
-            {:ok, :directory} ->
-              status = if destination_existed, do: 204, else: 201
-              send_resp(conn, status, "Copied")
-
-            {:ok, :file} ->
-              status = if destination_existed, do: 204, else: 201
-              send_resp(conn, status, "Copied")
-
-            {:error, reason} ->
-              send_resp(conn, 500, "Failed to copy: #{inspect(reason)}")
-          end
+          {:ok, source_path, destination_path}
       end
     end
+  end
+
+  defp parse_xml_body(conn) do
+    conn
+    |> read_body()
+    |> xpath(
+      ~x"//d:prop/*"l,
+      name: ~x"name()"s
+    )
+    |> Enum.map(& &1.name)
   end
 end
 
