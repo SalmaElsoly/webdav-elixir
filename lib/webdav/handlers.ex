@@ -3,8 +3,10 @@ defmodule Webdav.Handlers do
   require Logger
   import SweetXml
   @storage_path "./storage"
+  @metadata_path "./metadata"
 
   def init(storage_path) do
+    File.mkdir_p(@metadata_path)
     storage_path
   end
 
@@ -157,7 +159,38 @@ defmodule Webdav.Handlers do
 
   # proppatch in webdav
   def handle_proppatch(conn) do
-    send_resp(conn, 200, "Hello World")
+    path =
+      conn.request_path
+      |> String.replace("/webdav", "")
+      |> then(&Path.join(@storage_path, &1))
+
+    if File.exists?(path) do
+      case read_body(conn) do
+        {:ok, body, _conn} when byte_size(body) > 0 ->
+          try do
+
+            property_updates = parse_proppatch_xml(body)
+
+
+            save_properties(path, property_updates)
+
+            response_xml = build_proppatch_response(path, property_updates)
+
+            conn
+            |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+            |> send_resp(207, response_xml)
+          rescue
+            e ->
+              Logger.error("Error handling PROPPATCH: #{inspect(e)}")
+              send_resp(conn, 400, "Bad Request")
+          end
+
+        _ ->
+          send_resp(conn, 400, "Bad Request")
+      end
+    else
+      send_resp(conn, 404, "Not Found")
+    end
   end
 
   # lock in webdav
@@ -351,6 +384,9 @@ defmodule Webdav.Handlers do
   end
 
   defp build_response(path, properties) do
+   
+    custom_props = get_custom_properties(path)
+
     """
     <D:response>
       <D:href>#{if String.ends_with?(path, @storage_path), do: "webdav root", else: String.replace(path, @storage_path, "")}</D:href>
@@ -367,6 +403,8 @@ defmodule Webdav.Handlers do
         "displayname" -> String.replace(path, @storage_path, "")
         "getcontentlanguage" -> "en"
         "getetag" -> "W/\"#{path}\""
+        prop when is_map_key(custom_props, prop) -> custom_props[prop]
+        _ -> ""
       end}
       </D:#{prop}>
       """ end) |> Enum.join("\n")}
@@ -383,9 +421,139 @@ defmodule Webdav.Handlers do
 
   defp pad_number(number) when number < 10, do: "0#{number}"
   defp pad_number(number), do: "#{number}"
+
+  defp parse_proppatch_xml(body) do
+    property_sets = body |> xpath(~x"//D:set/D:prop/*"l)
+    property_removes = body |> xpath(~x"//D:remove/D:prop/*"l)
+
+    set_properties =
+      property_sets
+      |> Enum.map(fn node ->
+        name = node |> xpath(~x"local-name()"s)
+        value = node |> xpath(~x"text()"s)
+        {name, %{action: :set, value: value}}
+      end)
+      |> Enum.into(%{})
+
+    remove_properties =
+      property_removes
+      |> Enum.map(fn node ->
+        name = node |> xpath(~x"local-name()"s)
+        {name, %{action: :remove}}
+      end)
+      |> Enum.into(%{})
+
+    Map.merge(set_properties, remove_properties)
+  end
+
+  defp save_properties(path, property_updates) do
+    relative_path = String.replace(path, @storage_path, "")
+
+    metadata_file =
+      Path.join(
+        @metadata_path,
+        "#{:crypto.hash(:md5, relative_path) |> Base.encode16(case: :lower)}.json"
+      )
+
+    properties =
+      if File.exists?(metadata_file) do
+        metadata_file
+        |> File.read!()
+        |> Jason.decode!()
+      else
+        %{}
+      end
+
+    unchangable_properties = [
+      "creationdate",
+      "getcontentlength",
+      "getlastmodified",
+      "resourcetype",
+      "displayname",
+      "getcontenttype",
+      "getetag",
+      "getcontentlanguage"
+    ]
+
+    updated_properties =
+      Enum.reduce(property_updates, properties, fn {name, details}, acc ->
+        if name in unchangable_properties do
+          acc
+        else
+          case details.action do
+            :set -> Map.put(acc, name, details.value)
+            :remove -> Map.delete(acc, name)
+          end
+        end
+      end)
+
+    File.write!(metadata_file, Jason.encode!(updated_properties))
+  end
+
+  defp build_proppatch_response(path, property_updates) do
+    href = String.replace(path, @storage_path, "")
+
+    unchangable_properties = [
+      "creationdate",
+      "getcontentlength",
+      "getlastmodified",
+      "resourcetype",
+      "displayname",
+      "getcontenttype",
+      "getetag",
+      "getcontentlanguage"
+    ]
+
+    propstat_elements =
+      property_updates
+      |> Enum.map(fn {name, _details} ->
+        status =
+          if name in unchangable_properties do
+            "HTTP/1.1 409 Conflict"
+          else
+            "HTTP/1.1 200 OK"
+          end
+
+        """
+        <D:propstat>
+          <D:prop>
+            <D:#{name}/>
+          </D:prop>
+          <D:status>#{status}</D:status>
+        </D:propstat>
+        """
+      end)
+      |> Enum.join("\n")
+
+    """
+    <D:multistatus xmlns:D="DAV:">
+      <D:response>
+        <D:href>#{href}</D:href>
+        #{propstat_elements}
+      </D:response>
+    </D:multistatus>
+    """
+  end
+
+  defp get_custom_properties(path) do
+    relative_path = String.replace(path, @storage_path, "")
+
+    metadata_file =
+      Path.join(
+        @metadata_path,
+        "#{:crypto.hash(:md5, relative_path) |> Base.encode16(case: :lower)}.json"
+      )
+
+    if File.exists?(metadata_file) do
+      metadata_file
+      |> File.read!()
+      |> Jason.decode!()
+    else
+      %{}
+    end
+  end
 end
 
 # TODO:
-# - handle proppatch
 # - handle lock
 # - handle unlock
