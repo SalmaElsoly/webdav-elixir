@@ -2,6 +2,7 @@ defmodule Webdav.Handlers do
   import Plug.Conn
   require Logger
   import SweetXml
+  import UUID, only: [uuid4: 0]
   @storage_path "./storage"
   @metadata_path "./metadata"
 
@@ -65,21 +66,33 @@ defmodule Webdav.Handlers do
 
     Logger.info("Uploading file to #{file_path}")
 
-    case read_body(conn) do
-      {:ok, body, conn} ->
-        case File.write(file_path, body) do
-          :ok ->
-            send_resp(conn, 200, "File uploaded")
+    exists = File.exists?(file_path)
 
-          {:error, :enoent} ->
-            send_resp(conn, 409, "Conflict")
+    case check_lock(conn, file_path) do
+      :ok ->
+        case read_body(conn) do
+          {:ok, body, conn} ->
+            case File.write(file_path, body) do
+              :ok ->
+                if exists do
+                  send_resp(conn, 204, "")
+                else
+                  send_resp(conn, 201, "")
+                end
 
-          {:error, reason} ->
-            send_resp(conn, 500, "Failed to upload file #{inspect(reason)}")
+              {:error, :enoent} ->
+                send_resp(conn, 409, "Conflict")
+
+              {:error, reason} ->
+                send_resp(conn, 500, "Failed to upload file #{inspect(reason)}")
+            end
+
+          {:error, _} ->
+            send_resp(conn, 400, "Bad request")
         end
 
-      {:error, _} ->
-        send_resp(conn, 400, "Bad request")
+      {:error, :locked} ->
+        send_resp(conn, 423, "Resource is locked")
     end
   end
 
@@ -165,28 +178,32 @@ defmodule Webdav.Handlers do
       |> then(&Path.join(@storage_path, &1))
 
     if File.exists?(path) do
-      case read_body(conn) do
-        {:ok, body, _conn} when byte_size(body) > 0 ->
-          try do
+      case check_lock(conn, path) do
+        :ok ->
+          case read_body(conn) do
+            {:ok, body, _conn} when byte_size(body) > 0 ->
+              try do
+                property_updates = parse_proppatch_xml(body)
 
-            property_updates = parse_proppatch_xml(body)
+                save_properties(path, property_updates)
 
+                response_xml = build_proppatch_response(path, property_updates)
 
-            save_properties(path, property_updates)
+                conn
+                |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+                |> send_resp(207, response_xml)
+              rescue
+                e ->
+                  Logger.error("Error handling PROPPATCH: #{inspect(e)}")
+                  send_resp(conn, 400, "Bad Request")
+              end
 
-            response_xml = build_proppatch_response(path, property_updates)
-
-            conn
-            |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
-            |> send_resp(207, response_xml)
-          rescue
-            e ->
-              Logger.error("Error handling PROPPATCH: #{inspect(e)}")
+            _ ->
               send_resp(conn, 400, "Bad Request")
           end
 
-        _ ->
-          send_resp(conn, 400, "Bad Request")
+        {:error, :locked} ->
+          send_resp(conn, 423, "Resource is locked")
       end
     else
       send_resp(conn, 404, "Not Found")
@@ -195,17 +212,154 @@ defmodule Webdav.Handlers do
 
   # lock in webdav
   def handle_lock(conn) do
-    send_resp(conn, 200, "Hello World")
+    path =
+      conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
+
+    depth =
+      get_req_header(conn, "depth")
+      |> List.first()
+      |> case do
+        "0" -> 0
+        "1" -> 1
+        "infinity" -> :infinity
+        _ -> :infinity
+      end
+
+    timeout =
+      get_req_header(conn, "timeout")
+      |> List.first()
+      |> case do
+        "Infinite" -> "Infinite"
+        _ -> "Second-#{get_req_header(conn, "timeout") |> List.first()}"
+      end
+
+    if File.exists?(path) do
+      xml_properties = lock_xml_parser(conn)
+
+      lock_token = "opaquelocktoken:" <> uuid4()
+
+      apply_lock = fn file_path, lock_token ->
+        lock_properties = %{
+          "locktype" => %{action: :set, value: xml_properties["locktype"]},
+          "lockscope" => %{action: :set, value: xml_properties["lockscope"]},
+          "locktoken" => %{action: :set, value: lock_token},
+          "locktimeout" => %{action: :set, value: timeout}
+        }
+
+        save_properties(file_path, lock_properties)
+      end
+
+      case depth do
+        :infinity ->
+          recursive_lock(path, apply_lock, lock_token)
+
+        0 ->
+          apply_lock.(path, lock_token)
+
+        1 ->
+          File.ls(path)
+          |> Enum.each(fn file ->
+            unless File.dir?(Path.join(path, file)) do
+              apply_lock.(Path.join(path, file), lock_token)
+            end
+          end)
+
+        _ ->
+          send_resp(conn, 409, "Conflict")
+      end
+
+      xml_response = """
+      <?xml version="1.0" encoding="utf-8" ?>
+      <D:prop xmlns:D="DAV:">
+      <D:lockdiscovery>
+          <D:activelock>
+               <D:locktype>#{xml_properties["locktype"]}</D:locktype>
+               <D:lockscope>#{xml_properties["lockscope"]}</D:lockscope>
+               <D:depth>#{depth}</D:depth>
+               <D:owner>
+                    <D:href>
+                      #{xml_properties["owner"]}
+                    </D:href>
+               </D:owner>
+               <D:timeout>#{timeout}</D:timeout>
+               <D:locktoken>
+                    <D:href>
+                      #{lock_token}
+                    </D:href>
+               </D:locktoken>
+          </D:activelock>
+      </D:lockdiscovery>
+      </D:prop>
+      """
+
+      conn
+      |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+      |> send_resp(200, xml_response)
+    end
+  end
+
+  defp recursive_lock(path, apply_lock, lock_token) do
+    if File.dir?(path) do
+      File.ls(path)
+      |> Enum.each(fn file ->
+        recursive_lock(Path.join(path, file), apply_lock, lock_token)
+      end)
+    else
+      apply_lock.(path, lock_token)
+    end
   end
 
   # unlock in webdav
   def handle_unlock(conn) do
-    send_resp(conn, 200, "Hello World")
+    path =
+      conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
+
+    lock_token =
+      get_req_header(conn, "if")
+      |> List.first()
+      |> case do
+        nil -> nil
+        token -> String.trim(token, "<") |> String.trim(">")
+      end
+
+    if File.exists?(path) and lock_token do
+      unlock_recursive(path, lock_token)
+      send_resp(conn, 204, "")
+    else
+      send_resp(conn, 404, "Not Found")
+    end
+  end
+
+  defp unlock_recursive(path, lock_token) do
+    custom_properties = get_custom_properties(path)
+    stored_lock_token = custom_properties["locktoken"]
+
+    lock_props = ["locktoken", "locktimeout", "locktype", "lockscope"]
+    removal_map = Enum.into(lock_props, %{}, fn prop -> {prop, %{action: :remove}} end)
+
+    removed =
+      if stored_lock_token == lock_token do
+        save_properties(path, removal_map)
+        true
+      else
+        false
+      end
+
+    if File.dir?(path) do
+      File.ls!(path)
+      |> Enum.reduce(removed, fn file, acc ->
+        unlock_recursive(Path.join(path, file), lock_token) or acc
+      end)
+    else
+      removed
+    end
   end
 
   # move in webdav
   def handle_move(conn) do
-    with {:ok, source_path, destination_path} <- move_copy_options(conn) do
+    with {:ok, source_path, destination_path} <- move_copy_options(conn),
+         :ok <- check_lock(conn, source_path),
+         :ok <- check_lock(conn, destination_path) do
       cond do
         File.exists?(destination_path) ->
           File.rename(source_path, destination_path)
@@ -215,12 +369,20 @@ defmodule Webdav.Handlers do
           File.rename(source_path, destination_path)
           send_resp(conn, 201, "Moved")
       end
+    else
+      {:error, :locked} ->
+        send_resp(conn, 423, "Resource is locked")
+
+      error ->
+        error
     end
   end
 
   # copy in webdav
   def handle_copy(conn) do
-    with {:ok, source_path, destination_path} <- move_copy_options(conn) do
+    with {:ok, source_path, destination_path} <- move_copy_options(conn),
+         :ok <- check_lock(conn, source_path),
+         :ok <- check_lock(conn, destination_path) do
       destination_existed = File.exists?(destination_path)
 
       result =
@@ -265,6 +427,12 @@ defmodule Webdav.Handlers do
         {:error, reason} ->
           send_resp(conn, 500, "Failed to copy: #{inspect(reason)}")
       end
+    else
+      {:error, :locked} ->
+        send_resp(conn, 423, "Resource is locked")
+
+      error ->
+        error
     end
   end
 
@@ -384,7 +552,6 @@ defmodule Webdav.Handlers do
   end
 
   defp build_response(path, properties) do
-   
     custom_props = get_custom_properties(path)
 
     """
@@ -550,6 +717,46 @@ defmodule Webdav.Handlers do
       |> Jason.decode!()
     else
       %{}
+    end
+  end
+
+  defp lock_xml_parser(conn) do
+    case read_body(conn) do
+      {:ok, body, _conn} when byte_size(body) > 0 ->
+        body
+        |> xpath(~x"//D:lockinfo"l)
+        |> Enum.map(fn node ->
+          name = node |> xpath(~x"local-name()"s)
+          value = node |> xpath(~x"text()"s)
+          {name, value}
+        end)
+        |> Enum.into(%{})
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp check_lock(conn, path) do
+    custom_properties = get_custom_properties(path)
+    stored_lock_token = custom_properties["locktoken"]
+
+    if stored_lock_token do
+      provided_lock_token =
+        get_req_header(conn, "if")
+        |> List.first()
+        |> case do
+          nil -> nil
+          token -> String.trim(token, "<") |> String.trim(">")
+        end
+
+      if provided_lock_token == stored_lock_token do
+        :ok
+      else
+        {:error, :locked}
+      end
+    else
+      :ok
     end
   end
 end

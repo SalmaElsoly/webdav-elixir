@@ -27,7 +27,8 @@ defmodule Webdav.MixProject do
       {:plug_cowboy, "~> 2.0"},
       {:sweet_xml, "~> 0.7.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:uuid, "~> 1.1"}
     ]
   end
 end
