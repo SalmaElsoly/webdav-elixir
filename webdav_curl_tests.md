@@ -71,6 +71,19 @@ curl -X PROPFIND -H "Depth: 0" -H "Content-Type: text/xml" \
   http://localhost:8080/webdav/test.txt
 ```
 
+### Get custom property
+
+```bash
+   curl -X PROPFIND -H "Depth: 0" -H "Content-Type: text/xml" \
+  -d '<?xml version="1.0" encoding="utf-8" ?>
+<D:propfind xmlns:D="DAV:">
+  <D:prop>
+    <D:custom-property/>
+  </D:prop>
+</D:propfind>' \
+  http://localhost:8080/webdav/test.txt
+```
+
 ## PROPPATCH Requests
 
 ### Set a custom property
@@ -152,7 +165,7 @@ curl -X PUT -H "If: <lock-token>" -d "New content" http://localhost:8080/webdav/
 
 ```bash
 # Replace <lock-token> with the actual lock token received from LOCK request
-curl -X UNLOCK -H "If: <lock-token>" http://localhost:8080/webdav/test.txt
+curl -X UNLOCK -H "Lock-Token: <lock-token>" http://localhost:8080/webdav/test.txt
 ```
 
 ## Move and Copy Operations

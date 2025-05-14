@@ -39,7 +39,7 @@ defmodule Webdav.Handlers do
                         <ul>
                           #{files |> Enum.map(fn file ->
                       current_path = String.replace(node_path, @storage_path, "") |> Path.join(file)
-                      "<li><a href=\"/webdav#{current_path}\">#{file}</a></li>"
+                      "<li><a href=\"/webdav/#{current_path}\">#{file}</a></li>"
                     end) |> Enum.join("\n")}
                         </ul>
                     </body></html>"
@@ -159,7 +159,7 @@ defmodule Webdav.Handlers do
 
       try do
         conn
-        |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+        |> put_resp_header("Content-Type", "application/xml; charset=utf-8")
         |> send_resp(207, xml_builder(path, properties, depth))
       rescue
         e ->
@@ -315,7 +315,7 @@ defmodule Webdav.Handlers do
       conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
 
     lock_token =
-      get_req_header(conn, "lock-tocken")
+      get_req_header(conn, "lock-token")
       |> List.first()
       |> case do
         nil -> nil
@@ -556,7 +556,7 @@ defmodule Webdav.Handlers do
 
     """
     <D:response>
-      <D:href>#{if String.ends_with?(path, @storage_path), do: "webdav root", else: String.replace(path, @storage_path, "")}</D:href>
+      <D:href>#{if String.ends_with?(path, @storage_path), do: "/webdav/", else: String.replace(path, @storage_path, "")}</D:href>
       <D:propstat>
         <D:prop>
           #{properties |> Enum.map(fn prop -> """

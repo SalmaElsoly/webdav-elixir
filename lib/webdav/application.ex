@@ -15,14 +15,14 @@ defmodule Webdav.Application do
       File.mkdir_p!(storage_path)
     end
 
-    port = Keyword.get(args, :port, 8080)
+    port = Keyword.get(args, :port, 80)
 
     Webdav.Handlers.init(storage_path)
 
     Logger.info("Starting WebDAV server on port #{port}")
 
     children = [
-      {Plug.Cowboy, scheme: :http, plug: Webdav.Router, options: [port: port]}
+      {Plug.Cowboy, scheme: :http, plug: Webdav.Router, options: [port: port, ip: {0, 0, 0, 0}]}
     ]
 
     opts = [strategy: :one_for_one, name: Webdav.Supervisor]
