@@ -77,7 +77,7 @@ defmodule Webdav.Handlers do
                 if exists do
                   send_resp(conn, 204, "")
                 else
-                  send_resp(conn, 201, "")
+                  send_resp(conn, 201, "File Uploaded")
                 end
 
               {:error, :enoent} ->
@@ -315,7 +315,7 @@ defmodule Webdav.Handlers do
       conn.request_path |> String.replace("/webdav", "") |> then(&Path.join(@storage_path, &1))
 
     lock_token =
-      get_req_header(conn, "if")
+      get_req_header(conn, "lock-tocken")
       |> List.first()
       |> case do
         nil -> nil
