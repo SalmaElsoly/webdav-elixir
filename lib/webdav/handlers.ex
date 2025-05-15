@@ -72,6 +72,7 @@ defmodule Webdav.Handlers do
       :ok ->
         case read_body(conn) do
           {:ok, body, conn} ->
+
             case File.write(file_path, body) do
               :ok ->
                 if exists do
@@ -190,7 +191,7 @@ defmodule Webdav.Handlers do
                 response_xml = build_proppatch_response(path, property_updates)
 
                 conn
-                |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
+                |> put_resp_header("Content-Type", "application/xml; charset=utf-8")
                 |> send_resp(207, response_xml)
               rescue
                 e ->
@@ -230,72 +231,92 @@ defmodule Webdav.Handlers do
       |> List.first()
       |> case do
         "Infinite" -> "Infinite"
-        _ -> "Second-#{get_req_header(conn, "timeout") |> List.first()}"
+        _ -> "#{get_req_header(conn, "timeout") |> List.first()}"
       end
 
-    if File.exists?(path) do
-      xml_properties = lock_xml_parser(conn)
+    file_exists = File.exists?(path)
 
-      lock_token = "opaquelocktoken:" <> uuid4()
-
-      apply_lock = fn file_path, lock_token ->
-        lock_properties = %{
-          "locktype" => %{action: :set, value: xml_properties["locktype"]},
-          "lockscope" => %{action: :set, value: xml_properties["lockscope"]},
-          "locktoken" => %{action: :set, value: lock_token},
-          "locktimeout" => %{action: :set, value: timeout}
-        }
-
-        save_properties(file_path, lock_properties)
-      end
-
-      case depth do
-        :infinity ->
-          recursive_lock(path, apply_lock, lock_token)
-
-        0 ->
-          apply_lock.(path, lock_token)
-
-        1 ->
-          File.ls(path)
-          |> Enum.each(fn file ->
-            unless File.dir?(Path.join(path, file)) do
-              apply_lock.(Path.join(path, file), lock_token)
-            end
-          end)
-
-        _ ->
-          send_resp(conn, 409, "Conflict")
-      end
-
-      xml_response = """
-      <?xml version="1.0" encoding="utf-8" ?>
-      <D:prop xmlns:D="DAV:">
-      <D:lockdiscovery>
-          <D:activelock>
-               <D:locktype>#{xml_properties["locktype"]}</D:locktype>
-               <D:lockscope>#{xml_properties["lockscope"]}</D:lockscope>
-               <D:depth>#{depth}</D:depth>
-               <D:owner>
-                    <D:href>
-                      #{xml_properties["owner"]}
-                    </D:href>
-               </D:owner>
-               <D:timeout>#{timeout}</D:timeout>
-               <D:locktoken>
-                    <D:href>
-                      #{lock_token}
-                    </D:href>
-               </D:locktoken>
-          </D:activelock>
-      </D:lockdiscovery>
-      </D:prop>
-      """
-
-      conn
-      |> put_resp_header("Content-Type", "text/xml; charset=utf-8")
-      |> send_resp(200, xml_response)
+    unless file_exists do
+      Logger.info("Creating lock-null resource for #{path}")
     end
+
+    xml_properties = lock_xml_parser(conn)
+
+    Logger.info("Lock properties: #{inspect(xml_properties)}")
+
+    lock_token = "opaquelocktoken:" <> uuid4()
+
+    apply_lock = fn file_path, lock_token ->
+      lock_properties = %{
+        "locktype" => %{action: :set, value: xml_properties["locktype"]},
+        "lockscope" => %{action: :set, value: xml_properties["lockscope"]},
+        "locktoken" => %{action: :set, value: lock_token},
+        "locktimeout" => %{action: :set, value: timeout}
+      }
+
+      save_properties(file_path, lock_properties)
+    end
+
+    case depth do
+      :infinity ->
+        if file_exists do
+          recursive_lock(path, apply_lock, lock_token)
+        else
+          apply_lock.(path, lock_token)
+        end
+
+      0 ->
+        apply_lock.(path, lock_token)
+
+      1 ->
+        apply_lock.(path, lock_token)
+
+        if file_exists and File.dir?(path) do
+          File.ls(path)
+          |> case do
+            {:ok, files} ->
+              files
+              |> Enum.each(fn file ->
+                apply_lock.(Path.join(path, file), lock_token)
+              end)
+
+            {:error, reason} ->
+              send_resp(conn, 500, "Failed to list files #{inspect(reason)}")
+          end
+        end
+
+      _ ->
+        send_resp(conn, 409, "Conflict")
+    end
+
+    xml_response = """
+    <?xml version="1.0" encoding="utf-8" ?>
+    <D:prop xmlns:D="DAV:">
+    <D:lockdiscovery>
+        <D:activelock>
+             <D:locktype>#{xml_properties["locktype"]}</D:locktype>
+             <D:lockscope>#{xml_properties["lockscope"]}</D:lockscope>
+             <D:depth>#{depth}</D:depth>
+             <D:owner>
+                  <D:href>
+                    #{xml_properties["owner"]}
+                  </D:href>
+             </D:owner>
+             <D:timeout>#{timeout}</D:timeout>
+             <D:locktoken>
+                  <D:href>
+                    #{lock_token}
+                  </D:href>
+             </D:locktoken>
+        </D:activelock>
+    </D:lockdiscovery>
+    </D:prop>
+    """
+
+    conn
+    |> put_resp_header("Lock-Token", lock_token)
+    |> put_resp_header("Content-Type", "application/xml; charset=utf-8")
+    |> send_resp(200, xml_response)
   end
 
   defp recursive_lock(path, apply_lock, lock_token) do
@@ -556,7 +577,7 @@ defmodule Webdav.Handlers do
 
     """
     <D:response>
-      <D:href>#{if String.ends_with?(path, @storage_path), do: "/webdav/", else: String.replace(path, @storage_path, "")}</D:href>
+      <D:href>#{String.replace(path, @storage_path, "/webdav")}</D:href>
       <D:propstat>
         <D:prop>
           #{properties |> Enum.map(fn prop -> """
@@ -723,15 +744,16 @@ defmodule Webdav.Handlers do
   defp lock_xml_parser(conn) do
     case read_body(conn) do
       {:ok, body, _conn} when byte_size(body) > 0 ->
+        Logger.info("Body: #{inspect(body)}")
         body
-        |> xpath(~x"//D:lockinfo"l)
+        |> xpath(~x"//lockinfo/*"l)
         |> Enum.map(fn node ->
           name = node |> xpath(~x"local-name()"s)
-          value = node |> xpath(~x"text()"s)
+          has_children = node |> xpath(~x"count(./*)"i) > 0
+          value = if has_children, do: node |> xpath(~x"*[1]/local-name()"s), else: node |> xpath(~x"text()"s)
           {name, value}
         end)
         |> Enum.into(%{})
-
       _ ->
         %{}
     end
