@@ -613,11 +613,11 @@ defmodule Webdav.Handlers do
       <D:#{prop}>
       #{case prop do
         "getcontentlength" -> File.stat!(path).size
-        "getlastmodified" -> File.stat!(path).mtime |> format_datetime()
+        "getlastmodified" -> File.stat!(path).mtime |> format_rfc1123_datetime()
         "resourcetype" -> if File.dir?(path), do: "<D:collection/>", else: ""
         "creationdate" -> File.stat!(path).mtime |> format_datetime()
         "getcontenttype" -> MIME.from_path(path)
-        "displayname" -> String.replace(path, @storage_path, "")
+        "displayname" -> Path.basename(path)
         "getcontentlanguage" -> "en"
         "getetag" -> "W/\"#{path}\""
         prop when is_map_key(custom_props, prop) -> custom_props[prop]
@@ -638,6 +638,19 @@ defmodule Webdav.Handlers do
 
   defp pad_number(number) when number < 10, do: "0#{number}"
   defp pad_number(number), do: "#{number}"
+
+  defp format_rfc1123_datetime({{year, month, day}, {hour, min, sec}}) do
+    weekdays = ~w(Sun Mon Tue Wed Thu Fri Sat)
+    months = ~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+
+    {:ok, date} = Date.new(year, month, day)
+    {:ok, _time} = Time.new(hour, min, sec)
+
+    weekday = weekdays |> Enum.at(Date.day_of_week(date) - 1)
+    month_name = months |> Enum.at(month - 1)
+
+    "#{weekday}, #{pad_number(day)} #{month_name} #{year} #{pad_number(hour)}:#{pad_number(min)}:#{pad_number(sec)} GMT"
+  end
 
   defp parse_proppatch_xml(body) do
     property_sets = body |> xpath(~x"//D:set/D:prop/*"l)
