@@ -11,6 +11,23 @@ defmodule Webdav.Handlers do
     storage_path
   end
 
+  # head in webdav
+  def handle_head(conn) do
+    file_path =
+      conn.request_path
+      |> String.replace("/webdav", "")
+      |> then(&Path.join(@storage_path, &1))
+
+    if File.exists?(file_path) do
+      conn
+      |> put_resp_header("Content-Type", MIME.from_path(file_path))
+      |> put_resp_header("Content-Length", File.stat!(file_path).size |> Integer.to_string())
+      |> send_resp(200, "")
+    else
+      send_resp(conn, 404, "")
+    end
+  end
+
   # download file from webdav
   def handle_get(conn) do
     node_path =
@@ -72,9 +89,10 @@ defmodule Webdav.Handlers do
       :ok ->
         case read_body(conn) do
           {:ok, body, conn} ->
-
             case File.write(file_path, body) do
               :ok ->
+                # cleanup_swap_files(file_path)
+
                 if exists do
                   send_resp(conn, 204, "")
                 else
@@ -104,6 +122,21 @@ defmodule Webdav.Handlers do
 
     case File.rm(node_path) do
       :ok ->
+        relative_path = String.replace(node_path, @storage_path, "")
+
+        metadata_file =
+          Path.join(
+            @metadata_path,
+            "#{:crypto.hash(:md5, relative_path) |> Base.encode16(case: :lower)}.json"
+          )
+
+        Logger.info("Deleting metadata file: #{metadata_file}")
+
+        if File.exists?(metadata_file) do
+          Logger.info("Deleting metadata file: #{metadata_file}")
+          File.rm(metadata_file)
+        end
+
         send_resp(conn, 200, "File deleted")
 
       {:error, reason} ->
@@ -244,7 +277,7 @@ defmodule Webdav.Handlers do
 
     Logger.info("Lock properties: #{inspect(xml_properties)}")
 
-    lock_token = "opaquelocktoken:" <> uuid4()
+    lock_token = "urn:uuid:" <> uuid4()
 
     apply_lock = fn file_path, lock_token ->
       lock_properties = %{
@@ -284,37 +317,33 @@ defmodule Webdav.Handlers do
               send_resp(conn, 500, "Failed to list files #{inspect(reason)}")
           end
         end
-
-      _ ->
-        send_resp(conn, 409, "Conflict")
     end
 
     xml_response = """
     <?xml version="1.0" encoding="utf-8" ?>
     <D:prop xmlns:D="DAV:">
     <D:lockdiscovery>
-        <D:activelock>
-             <D:locktype>#{xml_properties["locktype"]}</D:locktype>
-             <D:lockscope>#{xml_properties["lockscope"]}</D:lockscope>
-             <D:depth>#{depth}</D:depth>
-             <D:owner>
-                  <D:href>
-                    #{xml_properties["owner"]}
-                  </D:href>
-             </D:owner>
-             <D:timeout>#{timeout}</D:timeout>
-             <D:locktoken>
-                  <D:href>
-                    #{lock_token}
-                  </D:href>
-             </D:locktoken>
-        </D:activelock>
+    <D:activelock>
+    <D:locktype>#{xml_properties["locktype"] |> Enum.map(fn lock_type -> "<D:#{lock_type}/>" end) |> Enum.join("")}</D:locktype>
+    <D:lockscope>#{xml_properties["lockscope"] |> Enum.map(fn lock_scope -> "<D:#{lock_scope}/>" end) |> Enum.join("")}</D:lockscope>
+    <D:depth>#{depth}</D:depth>
+    <D:owner>#{xml_properties["owner"]}</D:owner>
+    <D:timeout>#{timeout}</D:timeout>
+    <D:locktoken>
+    <D:href>#{lock_token}</D:href>
+    </D:locktoken>
+    <D:lockroot>
+    <D:href>#{conn.scheme}://#{conn.host}:#{conn.port}#{conn.request_path}</D:href>
+    </D:lockroot>
+    </D:activelock>
     </D:lockdiscovery>
     </D:prop>
     """
 
+    Logger.info("Lock response: #{inspect(xml_response)}")
+
     conn
-    |> put_resp_header("Lock-Token", lock_token)
+    |> put_resp_header("Lock-Token", "<#{lock_token}>")
     |> put_resp_header("Content-Type", "application/xml; charset=utf-8")
     |> send_resp(200, xml_response)
   end
@@ -745,15 +774,25 @@ defmodule Webdav.Handlers do
     case read_body(conn) do
       {:ok, body, _conn} when byte_size(body) > 0 ->
         Logger.info("Body: #{inspect(body)}")
+
         body
         |> xpath(~x"//lockinfo/*"l)
         |> Enum.map(fn node ->
           name = node |> xpath(~x"local-name()"s)
           has_children = node |> xpath(~x"count(./*)"i) > 0
-          value = if has_children, do: node |> xpath(~x"*[1]/local-name()"s), else: node |> xpath(~x"text()"s)
+
+          value =
+            if has_children,
+              do:
+                node
+                |> xpath(~x"./*"l)
+                |> Enum.map(fn child -> child |> xpath(~x"local-name()"s) end),
+              else: node |> xpath(~x"text()"s)
+
           {name, value}
         end)
         |> Enum.into(%{})
+
       _ ->
         %{}
     end
@@ -768,8 +807,14 @@ defmodule Webdav.Handlers do
         get_req_header(conn, "if")
         |> List.first()
         |> case do
-          nil -> nil
-          token -> String.trim(token, "<") |> String.trim(">")
+          nil ->
+            nil
+
+          token ->
+            case Regex.run(~r/<(urn:uuid:[^>]+)>/, token) do
+              [_, token] -> token
+              _ -> nil
+            end
         end
 
       if provided_lock_token == stored_lock_token do
@@ -782,7 +827,3 @@ defmodule Webdav.Handlers do
     end
   end
 end
-
-# TODO:
-# - handle lock
-# - handle unlock

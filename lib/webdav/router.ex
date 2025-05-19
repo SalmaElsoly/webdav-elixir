@@ -41,6 +41,9 @@ defmodule Webdav.Router do
       "COPY" ->
         Webdav.Handlers.handle_copy(conn)
 
+      "HEAD" ->
+        Webdav.Handlers.handle_head(conn)
+
       "OPTIONS" ->
         conn
         |> put_resp_header(
