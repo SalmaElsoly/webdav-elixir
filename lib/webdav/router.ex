@@ -8,6 +8,7 @@ defmodule Webdav.Router do
 
   match "webdav/*path" do
     conn = put_resp_header(conn, "DAV", "1, 2")
+    Logger.info([path: conn.request_path, method: conn.method, headers: conn.req_headers])
 
     case conn.method do
       "GET" ->
@@ -39,6 +40,9 @@ defmodule Webdav.Router do
 
       "COPY" ->
         Webdav.Handlers.handle_copy(conn)
+
+      "HEAD" ->
+        Webdav.Handlers.handle_head(conn)
 
       "OPTIONS" ->
         conn
